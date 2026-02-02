@@ -13,12 +13,12 @@ dependencies:
   cupertino_icons: ^1.0.8
   qr_flutter: ^4.1.0
   mobile_scanner: ^5.2.3
-  http: ^1.2.1
   uuid: ^4.4.0
   shared_preferences: ^2.2.3
-  flutter_webrtc: ^0.12.1
   permission_handler: ^11.3.1
   image_picker: ^1.1.2
+  translator: ^1.0.4+1
+  mqtt_client: ^10.1.0
 
 dev_dependencies:
   flutter_test:

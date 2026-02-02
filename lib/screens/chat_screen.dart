@@ -2,9 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:translator/translator.dart';
 import '../services/p2p_service.dart';
-import 'call_screen.dart';
 
 class ChatScreen extends StatefulWidget {
   final String peerAddress;
@@ -17,17 +16,33 @@ class ChatScreen extends StatefulWidget {
 class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController _messageController = TextEditingController();
   final FocusNode _focusNode = FocusNode();
+  final GoogleTranslator _translator = GoogleTranslator();
+  
   List<Map<String, dynamic>> _messages = [];
   bool _isPeerTyping = false;
   bool _isPeerOnline = false;
   String _peerName = "";
   String? _peerImageBase64;
   
+  // Translation States
+  bool _isOutgoingTranslationEnabled = false;
+  String _targetLangCode = 'en'; // Default target for outgoing
+  final Map<int, String?> _translatedMessages = {}; // Local cache for received translations
+  bool _isTranslating = false;
+
   Timer? _typingTimer;
   Timer? _onlineTimer;
   StreamSubscription? _messageSub;
   StreamSubscription? _presenceSub;
-  StreamSubscription? _callSub;
+
+  final List<Map<String, String>> _languages = [
+    {'code': 'bn', 'name': 'Bengali'},
+    {'code': 'en', 'name': 'English'},
+    {'code': 'ar', 'name': 'Arabic'},
+    {'code': 'hi', 'name': 'Hindi'},
+    {'code': 'es', 'name': 'Spanish'},
+    {'code': 'fr', 'name': 'French'},
+  ];
 
   @override
   void initState() {
@@ -71,64 +86,50 @@ class _ChatScreenState extends State<ChatScreen> {
         }
       }
     });
-
-    _callSub = P2PService().callSignalingStream.listen((data) {
-      if (mounted && data.containsKey('offer') && data['senderId'] == widget.peerAddress) {
-        final offer = RTCSessionDescription(data['offer']['sdp'], data['offer']['type']);
-        _showIncomingCallDialog(data['senderId'], data['isVideo'] ?? true, offer);
-      }
-    });
   }
 
-  void _showIncomingCallDialog(String senderId, bool isVideo, RTCSessionDescription offer) {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF1E1E1E),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: Row(
-          children: [
-            Icon(isVideo ? Icons.videocam : Icons.call, color: const Color(0xFF2E7D32)),
-            const SizedBox(width: 10),
-            Text(isVideo ? 'Video Call' : 'Audio Call', style: const TextStyle(color: Colors.white)),
-          ],
-        ),
-        content: Text('Incoming call from $_peerName', 
-          style: const TextStyle(color: Colors.white70)),
-        actions: [
-          TextButton(
-            child: const Text('Decline', style: TextStyle(color: Colors.redAccent)),
-            onPressed: () {
-              P2PService().sendCallSignaling(senderId, {'type': 'hangup'});
-              Navigator.pop(context);
-            },
-          ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2E7D32)),
-            child: const Text('Accept', style: TextStyle(color: Colors.white)),
-            onPressed: () {
-              Navigator.pop(context);
-              Navigator.push(context, MaterialPageRoute(
-                builder: (context) => CallScreen(
-                  peerId: senderId, 
-                  isVideo: isVideo, 
-                  isIncoming: true, 
-                  remoteOffer: offer
-                ),
-              ));
-            },
-          ),
-        ],
-      ),
-    );
+  // --- Translation Logic ---
+
+  Future<void> _translateAndSend() async {
+    String text = _messageController.text.trim();
+    if (text.isEmpty) return;
+
+    if (_isOutgoingTranslationEnabled) {
+      setState(() => _isTranslating = true);
+      try {
+        var translation = await _translator.translate(text, to: _targetLangCode);
+        text = translation.text;
+      } catch (e) {
+        debugPrint("Translation error: $e");
+      }
+      setState(() => _isTranslating = false);
+    }
+
+    P2PService().sendTextMessage(widget.peerAddress, text);
+    _messageController.clear();
+  }
+
+  Future<void> _translateReceivedMessage(int index, String text) async {
+    if (_translatedMessages.containsKey(index)) {
+      setState(() => _translatedMessages.remove(index));
+      return;
+    }
+
+    setState(() => _isTranslating = true);
+    try {
+      // Auto detect to Bengali (or user's preferred lang)
+      var translation = await _translator.translate(text, to: 'bn'); 
+      setState(() => _translatedMessages[index] = translation.text);
+    } catch (e) {
+      debugPrint("Translation error: $e");
+    }
+    setState(() => _isTranslating = false);
   }
 
   @override
   void dispose() {
     _messageSub?.cancel();
     _presenceSub?.cancel();
-    _callSub?.cancel();
     _typingTimer?.cancel();
     _onlineTimer?.cancel();
     _messageController.dispose();
@@ -141,9 +142,10 @@ class _ChatScreenState extends State<ChatScreen> {
     if (mounted) {
       setState(() {
         _messages = history;
-        // Extract peer info from history if available
         for (var msg in history.reversed) {
-          if (!msg['isMe']) {
+          // Safety Check: Avoid Null errors on 'isMe'
+          final bool isMe = msg['isMe'] == true;
+          if (!isMe) {
             if (msg['senderName'] != null) _peerName = msg['senderName'];
             if (msg['senderImage'] != null) _peerImageBase64 = msg['senderImage'];
             break;
@@ -153,23 +155,14 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  void _sendMessage() {
-    final text = _messageController.text.trim();
-    if (text.isEmpty) return;
-    P2PService().sendMessage(widget.peerAddress, text);
-    _messageController.clear();
-  }
-
   void _handleKey(RawKeyEvent event) {
     if (event is RawKeyDownEvent && event.logicalKey == LogicalKeyboardKey.enter) {
       final bool isControlPressed = event.isControlPressed;
       final bool isShiftPressed = event.isShiftPressed;
 
       if (!isControlPressed && !isShiftPressed) {
-        // Only Enter -> Send
-        _sendMessage();
+        _translateAndSend();
       } else {
-        // Control/Shift + Enter -> New Line
         final text = _messageController.text;
         final selection = _messageController.selection;
         final newText = text.replaceRange(selection.start, selection.end, "\n");
@@ -212,40 +205,98 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
         backgroundColor: const Color(0xFF1E1E1E),
         iconTheme: const IconThemeData(color: Colors.white),
-        actions: [
-          IconButton(icon: const Icon(Icons.call), onPressed: () => Navigator.push(context, MaterialPageRoute(
-            builder: (context) => CallScreen(peerId: widget.peerAddress, isVideo: false, isIncoming: false),
-          ))),
-          IconButton(icon: const Icon(Icons.videocam), onPressed: () => Navigator.push(context, MaterialPageRoute(
-            builder: (context) => CallScreen(peerId: widget.peerAddress, isVideo: true, isIncoming: false),
-          ))),
-        ],
+        actions: const [],
       ),
       body: Column(
         children: [
+          if (_isTranslating) const LinearProgressIndicator(backgroundColor: Colors.transparent, color: Color(0xFF2E7D32), minHeight: 2),
           Expanded(
             child: ListView.builder(
               reverse: true,
               padding: const EdgeInsets.all(15),
               itemCount: _messages.length,
               itemBuilder: (context, index) {
-                final msg = _messages[_messages.length - 1 - index];
+                final msgIndex = _messages.length - 1 - index;
+                final msg = _messages[msgIndex];
+                // Safety Check: Handle null 'isMe' safely
                 final bool isMe = msg['isMe'] == true;
+                final String text = msg['text'] ?? "";
+                final String? translatedText = _translatedMessages[msgIndex];
+
                 return Align(
                   alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
-                  child: Container(
-                    margin: const EdgeInsets.symmetric(vertical: 5),
-                    padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 10),
-                    decoration: BoxDecoration(
-                      color: isMe ? const Color(0xFF2E7D32) : const Color(0xFF2C2C2C),
-                      borderRadius: BorderRadius.circular(15),
-                    ),
-                    child: Text(msg['text'] ?? "", style: const TextStyle(color: Colors.white)),
+                  child: Column(
+                    crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+                    children: [
+                      GestureDetector(
+                        onLongPress: () => _translateReceivedMessage(msgIndex, text),
+                        child: Container(
+                          margin: const EdgeInsets.symmetric(vertical: 5),
+                          padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 10),
+                          constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
+                          decoration: BoxDecoration(
+                            color: isMe ? const Color(0xFF2E7D32) : const Color(0xFF2C2C2C),
+                            borderRadius: BorderRadius.circular(15),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(text, style: const TextStyle(color: Colors.white)),
+                              if (translatedText != null) ...[
+                                const Divider(color: Colors.white24),
+                                Text(translatedText, style: const TextStyle(color: Colors.yellowAccent, fontSize: 13, fontStyle: FontStyle.italic)),
+                              ]
+                            ],
+                          ),
+                        ),
+                      ),
+                      if (!isMe && translatedText == null)
+                        Padding(
+                          padding: const EdgeInsets.only(left: 5, bottom: 8),
+                          child: InkWell(
+                            onTap: () => _translateReceivedMessage(msgIndex, text),
+                            child: const Text('Translate', style: TextStyle(color: Colors.white54, fontSize: 10)),
+                          ),
+                        )
+                    ],
                   ),
                 );
               },
             ),
           ),
+          
+          // Translation Controls for Outgoing
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+            color: const Color(0xFF1E1E1E),
+            child: Row(
+              children: [
+                const Icon(Icons.g_translate, size: 16, color: Colors.white54),
+                const SizedBox(width: 8),
+                const Text('Auto-translate outgoing:', style: TextStyle(color: Colors.white54, fontSize: 12)),
+                Transform.scale(
+                  scale: 0.7,
+                  child: Switch(
+                    value: _isOutgoingTranslationEnabled,
+                    onChanged: (val) => setState(() => _isOutgoingTranslationEnabled = val),
+                    activeColor: const Color(0xFF2E7D32),
+                  ),
+                ),
+                if (_isOutgoingTranslationEnabled)
+                  DropdownButton<String>(
+                    value: _targetLangCode,
+                    dropdownColor: const Color(0xFF1E1E1E),
+                    underline: const SizedBox(),
+                    items: _languages.map((l) => DropdownMenuItem(
+                      value: l['code'],
+                      child: Text(l['name']!, style: const TextStyle(color: Colors.white, fontSize: 12)),
+                    )).toList(),
+                    onChanged: (val) => setState(() => _targetLangCode = val!),
+                  ),
+              ],
+            ),
+          ),
+
           Container(
             padding: const EdgeInsets.all(10),
             color: const Color(0xFF1E1E1E),
@@ -253,7 +304,7 @@ class _ChatScreenState extends State<ChatScreen> {
               children: [
                 Expanded(
                   child: RawKeyboardListener(
-                    focusNode: FocusNode(), // Separate focus node for the listener
+                    focusNode: FocusNode(),
                     onKey: _handleKey,
                     child: TextField(
                       controller: _messageController,
@@ -270,7 +321,10 @@ class _ChatScreenState extends State<ChatScreen> {
                     ),
                   ),
                 ),
-                IconButton(icon: const Icon(Icons.send, color: Color(0xFF2E7D32)), onPressed: _sendMessage),
+                IconButton(
+                  icon: const Icon(Icons.send, color: Color(0xFF2E7D32)), 
+                  onPressed: _translateAndSend
+                ),
               ],
             ),
           ),

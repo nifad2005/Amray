@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
-import 'package:http/http.dart' as http;
-import 'package:uuid/uuid.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:uuid/uuid.dart';
+import 'mqtt_service.dart';
 
 enum ConnectionStatus { disconnected, connecting, connected, error }
 
@@ -11,232 +11,239 @@ class P2PService {
   factory P2PService() => _instance;
   P2PService._internal();
 
+  // Core Identity
   late String _myId;
-  String _myName = "User";
+  String _myName = "বন্ধু";
   String? _myImageBase64;
-  
+
+  // Streams for UI communication
   final _messageController = StreamController<Map<String, dynamic>>.broadcast();
-  Stream<Map<String, dynamic>> get messageStream => _messageController.stream;
-
-  final _peerDiscoveryController = StreamController<String>.broadcast();
-  Stream<String> get peerDiscoveryStream => _peerDiscoveryController.stream;
-
   final _statusController = StreamController<ConnectionStatus>.broadcast();
-  Stream<ConnectionStatus> get statusStream => _statusController.stream;
-
   final _presenceController = StreamController<Map<String, dynamic>>.broadcast();
-  Stream<Map<String, dynamic>> get presenceStream => _presenceController.stream;
-
+  final _peerDiscoveryController = StreamController<String>.broadcast();
   final _callSignalingController = StreamController<Map<String, dynamic>>.broadcast();
+
+  Stream<Map<String, dynamic>> get messageStream => _messageController.stream;
+  Stream<ConnectionStatus> get statusStream => _statusController.stream;
+  Stream<Map<String, dynamic>> get presenceStream => _presenceController.stream;
+  Stream<String> get peerDiscoveryStream => _peerDiscoveryController.stream;
   Stream<Map<String, dynamic>> get callSignalingStream => _callSignalingController.stream;
 
+  // Operational State
   ConnectionStatus _currentStatus = ConnectionStatus.disconnected;
   ConnectionStatus get currentStatus => _currentStatus;
-
-  bool _isListening = false;
   List<String> friends = [];
+  final Map<String, DateTime> onlineFriends = {};
   Timer? _heartbeatTimer;
-  http.Client? _client;
+  Timer? _reconnectTimer;
+  MqttService? _mqttService;
+  bool _isInitialized = false;
 
   Future<void> init() async {
+    if (_isInitialized) return;
+    
     final prefs = await SharedPreferences.getInstance();
     _myId = prefs.getString('my_id') ?? "amray_${const Uuid().v4().substring(0, 8)}";
     await prefs.setString('my_id', _myId);
     
     _myName = prefs.getString('user_name') ?? "বন্ধু";
-    _myImageBase64 = prefs.getString('profile_image_base64'); // We'll store a small base64 version for P2P
-    
+    _myImageBase64 = prefs.getString('profile_image_base64');
     friends = prefs.getStringList('friends') ?? [];
-
-    if (_isListening) return;
-    _startListening();
-    _startHeartbeat();
+    
+    _isInitialized = true;
+    _connect();
   }
 
   void _updateStatus(ConnectionStatus status) {
+    if (_currentStatus == status) return;
     _currentStatus = status;
     _statusController.add(status);
+    print("[P2P Service] Global Status: $status");
   }
 
-  void _startHeartbeat() {
-    _heartbeatTimer?.cancel();
-    _heartbeatTimer = Timer.periodic(const Duration(seconds: 15), (timer) {
-      if (_currentStatus == ConnectionStatus.connected) {
-        for (var friendId in friends) {
-          _sendPresence(friendId, 'online');
-        }
-      }
-    });
-  }
-
-  Future<void> addFriend(String? friendId) async {
-    if (friendId == null || friendId.isEmpty || friendId == _myId) return;
-    if (!friends.contains(friendId)) {
-      friends.add(friendId);
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setStringList('friends', friends);
-      _peerDiscoveryController.add(friendId);
-      print("Friend added successfully: $friendId");
-    }
-  }
-
-  void _startListening() async {
-    if (_isListening) return;
-    _isListening = true;
+  void _connect() {
+    _reconnectTimer?.cancel();
+    _mqttService?.dispose();
+    
     _updateStatus(ConnectionStatus.connecting);
+    
+    _mqttService = MqttService(myId: _myId);
+    _mqttService!.onConnectedCallback = _handleConnected;
+    _mqttService!.onDisconnectedCallback = _handleDisconnected;
+    _mqttService!.connect();
+    
+    _mqttService!.incomingMessages.listen(_processIncomingPayload, 
+      onError: (e) => print("[P2P Service] Data Stream Error: $e"));
+  }
 
-    _client?.close();
-    _client = http.Client();
-    final url = Uri.parse("https://ntfy.sh/$_myId/json");
-
-    try {
-      final request = http.Request("GET", url);
-      final response = await _client!.send(request);
-      
-      if (response.statusCode == 200) {
-        _updateStatus(ConnectionStatus.connected);
-      }
-
-      response.stream
-          .transform(utf8.decoder)
-          .transform(const LineSplitter())
-          .listen((line) async {
-        if (line.trim().isEmpty) return;
-        try {
-          final data = jsonDecode(line);
-          if (data['event'] != 'message' || data['message'] == null) return;
-          
-          final Map<String, dynamic> payload = jsonDecode(data['message']);
-          final String? senderId = payload['senderId'];
-          final String type = payload['type'] ?? 'message';
-
-          if (senderId == null || senderId == _myId) return;
-
-          if (type == 'call_signaling') {
-            _callSignalingController.add(payload);
-          } else if (type == 'presence') {
-            _presenceController.add({
-              'senderId': senderId, 
-              'status': payload['status'],
-              'senderName': payload['senderName'],
-              'senderImage': payload['senderImage'],
-            });
-          } else if (type == 'handshake') {
-            await addFriend(senderId);
-          } else if (type == 'message') {
-            final String text = payload['text']?.toString().trim() ?? "";
-            if (text.isNotEmpty) {
-              final msg = {
-                'senderId': senderId,
-                'peerId': senderId,
-                'senderName': payload['senderName'] ?? "বন্ধু",
-                'senderImage': payload['senderImage'],
-                'text': text,
-                'isMe': false,
-                'timestamp': DateTime.now().millisecondsSinceEpoch,
-              };
-              _messageController.add(msg);
-              _saveMessage(senderId, msg);
-            }
-          }
-        } catch (e) {
-          print("Payload processing error: $e");
-        }
-      }, onDone: () {
-        _isListening = false;
-        _updateStatus(ConnectionStatus.disconnected);
-        Future.delayed(const Duration(seconds: 3), () => _startListening());
-      }, onError: (e) {
-        _isListening = false;
-        _updateStatus(ConnectionStatus.error);
-        Future.delayed(const Duration(seconds: 5), () => _startListening());
-      });
-    } catch (e) {
-      _isListening = false;
-      _updateStatus(ConnectionStatus.error);
-      Future.delayed(const Duration(seconds: 5), () => _startListening());
+  void _handleConnected() {
+    _updateStatus(ConnectionStatus.connected);
+    _startMaintenanceTimers();
+    // Announce presence to known friends
+    for (var id in friends) {
+      _sendPresence(id, 'online');
     }
   }
 
-  Future<void> _saveMessage(String peerId, Map<String, dynamic> msg) async {
-    final prefs = await SharedPreferences.getInstance();
-    final String key = 'chat_$peerId';
-    List<String> history = prefs.getStringList(key) ?? [];
-    history.add(jsonEncode(msg));
-    if (history.length > 100) history.removeAt(0);
-    await prefs.setStringList(key, history);
-  }
-
-  Future<List<Map<String, dynamic>>> getChatHistory(String peerId) async {
-    final prefs = await SharedPreferences.getInstance();
-    final String key = 'chat_$peerId';
-    List<String> history = prefs.getStringList(key) ?? [];
-    return history.map((e) => jsonDecode(e) as Map<String, dynamic>).toList();
-  }
-
-  void sendCallSignaling(String remoteId, Map<String, dynamic> signal) {
-    _sendRaw(remoteId, {
-      'senderId': _myId, 
-      'senderName': _myName,
-      'type': 'call_signaling', 
-      ...signal
+  void _handleDisconnected() {
+    _updateStatus(ConnectionStatus.disconnected);
+    _stopMaintenanceTimers();
+    
+    // Attempt exponential backoff or simple delayed retry
+    _reconnectTimer = Timer(const Duration(seconds: 5), () {
+      if (_currentStatus != ConnectionStatus.connected) {
+        print("[P2P Service] Attempting auto-reconnect...");
+        _connect();
+      }
     });
   }
 
-  void sendMessage(String remoteId, String message) async {
-    final text = message.trim();
-    if (text.isEmpty) return;
-    final msg = {
-      'senderId': _myId, 
-      'peerId': remoteId, 
-      'text': text, 
-      'isMe': true, 
-      'timestamp': DateTime.now().millisecondsSinceEpoch
+  void _processIncomingPayload(Map<String, dynamic> payload) {
+    final String? senderId = payload['senderId'];
+    if (senderId == null || senderId == _myId) return;
+
+    final String type = payload['type'] ?? 'message';
+
+    switch (type) {
+      case 'handshake':
+        addFriend(senderId);
+        sendHandshakeReply(senderId);
+        break;
+      case 'handshake_reply':
+        addFriend(senderId);
+        break;
+      case 'presence':
+        if (payload['status'] == 'online') onlineFriends[senderId] = DateTime.now();
+        _presenceController.add(payload);
+        break;
+      case 'message':
+        final msg = {
+          ...payload,
+          'isMe': false,
+          'timestamp': DateTime.now().millisecondsSinceEpoch,
+          'peerId': senderId,
+        };
+        _messageController.add(msg);
+        _saveToHistory(senderId, msg);
+        break;
+      case 'call_signaling':
+        _callSignalingController.add(payload);
+        break;
+    }
+  }
+
+  // --- Public Methods ---
+
+  void sendTextMessage(String remoteId, String text) {
+    final payload = {
+      'senderId': _myId,
+      'senderName': _myName,
+      'senderImage': _myImageBase64,
+      'text': text,
+      'type': 'message',
     };
-    _messageController.add(msg);
-    _saveMessage(remoteId, msg);
-    _sendRaw(remoteId, {
-      'senderId': _myId, 
-      'senderName': _myName,
-      'senderImage': _myImageBase64,
-      'text': text, 
-      'type': 'message'
-    });
+    _mqttService?.publish("amray/user/$remoteId", payload);
+
+    final localMsg = {
+      ...payload,
+      'isMe': true,
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+      'peerId': remoteId,
+    };
+    _messageController.add(localMsg);
+    _saveToHistory(remoteId, localMsg);
   }
-
-  void _sendPresence(String remoteId, String status) {
-    _sendRaw(remoteId, {
-      'senderId': _myId, 
-      'senderName': _myName,
-      'senderImage': _myImageBase64,
-      'type': 'presence', 
-      'status': status
-    });
-  }
-
-  void setTyping(String remoteId) => _sendPresence(remoteId, 'typing');
-
-  String getMyAddress() => _myId;
 
   void sendHandshake(String remoteId) {
-    addFriend(remoteId);
-    _sendRaw(remoteId, {
-      'senderId': _myId, 
+    addFriend(remoteId); // Optimistic add
+    _mqttService?.publish("amray/user/$remoteId", {
+      'senderId': _myId,
       'senderName': _myName,
       'senderImage': _myImageBase64,
       'type': 'handshake'
     });
   }
 
-  Future<void> _sendRaw(String topic, Map<String, dynamic> data) async {
-    try {
-      await http.post(
-        Uri.parse("https://ntfy.sh/$topic"), 
-        body: jsonEncode(data),
-        headers: {'Title': 'Amray Signal'}
-      );
-    } catch (e) {
-      print("Send error: $e");
-    }
+  void sendHandshakeReply(String remoteId) {
+    _mqttService?.publish("amray/user/$remoteId", {
+      'senderId': _myId,
+      'senderName': _myName,
+      'senderImage': _myImageBase64,
+      'type': 'handshake_reply'
+    });
+  }
+
+  void _sendPresence(String remoteId, String status) {
+    _mqttService?.publish("amray/user/$remoteId", {
+      'senderId': _myId,
+      'senderName': _myName,
+      'senderImage': _myImageBase64,
+      'type': 'presence',
+      'status': status,
+    });
+  }
+
+  void setTyping(String remoteId) => _sendPresence(remoteId, 'typing');
+
+  // --- Internals ---
+
+  void _startMaintenanceTimers() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = Timer.periodic(const Duration(seconds: 40), (timer) {
+      for (var id in friends) {
+        _sendPresence(id, 'online');
+      }
+    });
+  }
+
+  void _stopMaintenanceTimers() {
+    _heartbeatTimer?.cancel();
+  }
+
+  Future<void> addFriend(String? friendId) async {
+    if (friendId == null || friendId.isEmpty || friendId == _myId || friends.contains(friendId)) return;
+    friends.add(friendId);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('friends', friends);
+    _peerDiscoveryController.add(friendId);
+  }
+
+  bool isOnline(String friendId) {
+    if (!onlineFriends.containsKey(friendId)) return false;
+    return DateTime.now().difference(onlineFriends[friendId]!).inSeconds < 100;
+  }
+
+  Future<void> _saveToHistory(String peerId, Map<String, dynamic> msg) async {
+    final prefs = await SharedPreferences.getInstance();
+    final key = 'chat_$peerId';
+    final history = prefs.getStringList(key) ?? [];
+    history.add(jsonEncode(msg));
+    if (history.length > 150) history.removeAt(0);
+    await prefs.setStringList(key, history);
+  }
+
+  Future<List<Map<String, dynamic>>> getChatHistory(String peerId) async {
+    final prefs = await SharedPreferences.getInstance();
+    final key = 'chat_$peerId';
+    return (prefs.getStringList(key) ?? []).map((e) {
+      try {
+        return jsonDecode(e) as Map<String, dynamic>;
+      } catch (_) {
+        return <String, dynamic>{};
+      }
+    }).where((m) => m.isNotEmpty).toList();
+  }
+
+  String getMyAddress() => _myId;
+
+  void dispose() {
+    _messageController.close();
+    _statusController.close();
+    _presenceController.close();
+    _peerDiscoveryController.close();
+    _callSignalingController.close();
+    _heartbeatTimer?.cancel();
+    _reconnectTimer?.cancel();
+    _mqttService?.dispose();
   }
 }

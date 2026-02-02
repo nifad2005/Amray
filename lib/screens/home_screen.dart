@@ -1,12 +1,10 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
-import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../services/p2p_service.dart';
 import 'chat_screen.dart';
 import 'qr_display_screen.dart';
 import 'scanner_screen.dart';
 import 'settings_screen.dart';
-import 'call_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -16,7 +14,7 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  StreamSubscription? _callSub;
+  StreamSubscription? _presenceSub;
 
   @override
   void initState() {
@@ -25,63 +23,16 @@ class _HomeScreenState extends State<HomeScreen> {
       if (mounted) setState(() {});
     });
 
-    // Global listener for incoming calls
-    _callSub = P2PService().callSignalingStream.listen((data) {
-      if (mounted && data.containsKey('offer')) {
-        final offer = RTCSessionDescription(data['offer']['sdp'], data['offer']['type']);
-        _showIncomingCallDialog(data['senderId'], data['isVideo'] ?? true, offer);
-      }
+    // Refresh home screen when any friend's status changes
+    _presenceSub = P2PService().presenceStream.listen((_) {
+      if (mounted) setState(() {});
     });
   }
 
   @override
   void dispose() {
-    _callSub?.cancel();
+    _presenceSub?.cancel();
     super.dispose();
-  }
-
-  void _showIncomingCallDialog(String senderId, bool isVideo, RTCSessionDescription offer) {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF1E1E1E),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: Row(
-          children: [
-            Icon(isVideo ? Icons.videocam : Icons.call, color: const Color(0xFF2E7D32)),
-            const SizedBox(width: 10),
-            Text(isVideo ? 'Video Call' : 'Audio Call', style: const TextStyle(color: Colors.white)),
-          ],
-        ),
-        content: Text('Incoming call from বন্ধু ${senderId.substring(senderId.length - 6)}', 
-          style: const TextStyle(color: Colors.white70)),
-        actions: [
-          TextButton(
-            child: const Text('Decline', style: TextStyle(color: Colors.redAccent)),
-            onPressed: () {
-              P2PService().sendCallSignaling(senderId, {'type': 'hangup'});
-              Navigator.pop(context);
-            },
-          ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2E7D32)),
-            child: const Text('Accept', style: TextStyle(color: Colors.white)),
-            onPressed: () {
-              Navigator.pop(context);
-              Navigator.push(context, MaterialPageRoute(
-                builder: (context) => CallScreen(
-                  peerId: senderId, 
-                  isVideo: isVideo, 
-                  isIncoming: true, 
-                  remoteOffer: offer
-                ),
-              ));
-            },
-          ),
-        ],
-      ),
-    );
   }
 
   @override
@@ -162,14 +113,33 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildFriendTile(BuildContext context, String friendId) {
+    bool isFriendOnline = P2PService().isOnline(friendId);
     return Card(
       child: ListTile(
-        leading: CircleAvatar(
-          backgroundColor: const Color(0xFF2E7D32),
-          child: Text(friendId.substring(6, 8).toUpperCase(), style: const TextStyle(color: Colors.white)),
+        leading: Stack(
+          children: [
+            CircleAvatar(
+              backgroundColor: const Color(0xFF2E7D32),
+              child: Text(friendId.substring(6, 8).toUpperCase(), style: const TextStyle(color: Colors.white)),
+            ),
+            if (isFriendOnline)
+              Positioned(
+                right: 0,
+                bottom: 0,
+                child: Container(
+                  width: 12,
+                  height: 12,
+                  decoration: BoxDecoration(
+                    color: Colors.greenAccent,
+                    shape: BoxShape.circle,
+                    border: Border.all(color: const Color(0xFF1E1E1E), width: 2),
+                  ),
+                ),
+              ),
+          ],
         ),
         title: Text('বন্ধু ${friendId.substring(6, 12)}', style: const TextStyle(color: Colors.white)),
-        subtitle: const Text('Tap to chat', style: TextStyle(color: Colors.white54)),
+        subtitle: Text(isFriendOnline ? 'Online' : 'Offline', style: TextStyle(color: isFriendOnline ? Colors.greenAccent : Colors.white54, fontSize: 12)),
         onTap: () => Navigator.push(context, MaterialPageRoute(builder: (context) => ChatScreen(peerAddress: friendId))),
       ),
     );

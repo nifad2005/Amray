@@ -36,9 +36,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _pickImage() async {
     final XFile? pickedFile = await _picker.pickImage(
       source: ImageSource.gallery,
-      maxWidth: 100, // Small for base64 sharing
-      maxHeight: 100,
-      imageQuality: 50,
+      maxWidth: 48, // Very small for signaling limits (4KB)
+      maxHeight: 48,
+      imageQuality: 25,
     );
     
     if (pickedFile != null) {
@@ -53,7 +53,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _imagePath = pickedFile.path;
       });
       
-      // Re-init service to update local variables
       await P2PService().init();
     }
   }
@@ -63,7 +62,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final name = _nameController.text.trim();
     await prefs.setString('user_name', name);
     
-    // Re-init service to update local variables
     await P2PService().init();
     
     if (mounted) {
